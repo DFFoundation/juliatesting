@@ -1,9 +1,12 @@
+// server/sync.js
+// Cron jobs and sync logic — uses CourtListener as primary data source
+
 const cron = require("node-cron");
-const { runCaseSearch, DEMOCRACY_NOS_CODES } = require("./pacer");
-const { checkAllApprovedForUpdates, subscribeToDocket } = require("./courtlistener");
 const db = require("./db");
+const cl = require("./courtlistener");
 const logger = require("./logger");
 
+// SSE clients waiting for progress updates
 const sseClients = new Set();
 
 function addSseClient(res) {
@@ -11,118 +14,157 @@ function addSseClient(res) {
   res.on("close", () => sseClients.delete(res));
 }
 
-function broadcast(data) {
-  const msg = `data: ${JSON.stringify(data)}\n\n`;
+function broadcast(event, data) {
+  const payload = `data: ${JSON.stringify({ event, ...data })}\n\n`;
   for (const client of sseClients) {
-    try { client.write(msg); } catch {}
+    try {
+      client.write(payload);
+    } catch (_) {
+      sseClients.delete(client);
+    }
   }
 }
 
-async function runCaseIdentificationSync(options = {}) {
-  const params = {
-    dateFrom: options.dateFrom || process.env.DEFAULT_DATE_FROM || "2025-01-20",
-    dateTo: options.dateTo || new Date().toISOString().split("T")[0],
-    nosCodes: options.nosCodes || DEMOCRACY_NOS_CODES,
-    courts: options.courts || null,
-    enrichParties: options.enrichParties ?? false,
-  };
+// ── Case Sync ────────────────────────────────────────────────────────────────
+async function syncCases(options = {}) {
+  const dateFrom = options.dateFrom || process.env.DEFAULT_DATE_FROM || "2025-01-20";
+  const dateTo = options.dateTo || null;
+  const nosCodes = options.nosCodes || null;
 
-  const syncId = await db.startSyncLog("case_search", params);
-  logger.info(`Starting case identification sync (syncId: ${syncId})`);
-  broadcast({ type: "sync_start", syncType: "case_search", syncId });
+  logger.info(`Starting case sync from ${dateFrom}${dateTo ? ` to ${dateTo}` : ""}`);
+  broadcast("sync_start", { message: "Starting case sync from CourtListener…" });
+
+  const logId = await db.insertSyncLog({
+    type: "cases",
+    status: "running",
+    startedAt: new Date().toISOString(),
+  });
 
   try {
-    const { eligible, excluded, total } = await runCaseSearch(params, (progress) => {
-      logger.debug(progress.message);
-      broadcast({ type: "progress", ...progress });
+    const onProgress = (p) => {
+      logger.info(`Sync: ${p.message}`);
+      broadcast("sync_progress", p);
+    };
+
+    const { eligible, excluded, total } = await cl.searchCases(
+      { dateFrom, dateTo, nosCodes },
+      onProgress
+    );
+
+    // Upsert eligible cases
+    let added = 0;
+    let updated = 0;
+    for (const c of eligible) {
+      const existing = await db.getCaseById(c.id);
+      if (existing) {
+        // Don't overwrite manual review status
+        await db.updateCase(c.id, {
+          caseName: c.caseName,
+          docketNumber: c.docketNumber,
+          filingDate: c.filingDate,
+          court: c.court,
+          courtId: c.courtId,
+          nosCode: c.nosCode,
+          nosLabel: c.nosLabel,
+          caseType: c.caseType,
+          courtListenerDocketId: c.courtListenerDocketId,
+          courtListenerLink: c.courtListenerLink,
+          lastUpdated: c.lastUpdated,
+        });
+        updated++;
+      } else {
+        await db.insertCase(c);
+        added++;
+      }
+    }
+
+    // Store excluded cases for reference
+    for (const c of excluded) {
+      const existing = await db.getCaseById(c.id);
+      if (!existing) {
+        await db.insertCase({ ...c, status: "Excluded", exclusionReason: c.exclusionReason });
+      }
+    }
+
+    const summary = `Sync complete: ${added} new, ${updated} updated, ${excluded.length} excluded from ${total} total`;
+    logger.info(summary);
+    broadcast("sync_complete", { message: summary, added, updated, excluded: excluded.length, total });
+
+    await db.updateSyncLog(logId, {
+      status: "success",
+      completedAt: new Date().toISOString(),
+      casesFound: total,
+      casesAdded: added,
+      casesUpdated: updated,
+      casesExcluded: excluded.length,
+      message: summary,
     });
 
-    let newCases = 0;
-    for (const c of eligible) {
-      const existing = await db.getCase(c.id);
-      if (!existing) { await db.upsertCase({ ...c, reviewStatus: "pending" }); newCases++; }
-    }
-    for (const c of excluded) {
-      const existing = await db.getCase(c.id);
-      if (!existing) await db.upsertCase({ ...c, reviewStatus: "excluded" });
-    }
-
-    await db.completeSyncLog(syncId, { casesFound: total, casesEligible: eligible.length, casesExcluded: excluded.length });
-    const result = { total, eligible: eligible.length, excluded: excluded.length, newCases };
-    broadcast({ type: "sync_complete", syncType: "case_search", ...result });
-    logger.info(`Case sync complete: ${newCases} new, ${eligible.length} eligible, ${excluded.length} excluded`);
-    return result;
+    return { added, updated, excluded: excluded.length, total };
   } catch (err) {
-    await db.failSyncLog(syncId, err.message);
-    broadcast({ type: "sync_error", syncType: "case_search", error: err.message });
     logger.error(`Case sync failed: ${err.message}`);
+    broadcast("sync_error", { message: err.message });
+    await db.updateSyncLog(logId, {
+      status: "error",
+      completedAt: new Date().toISOString(),
+      message: err.message,
+    });
     throw err;
   }
 }
 
-async function runUpdateTrackingSync() {
-  const syncId = await db.startSyncLog("update_check");
-  logger.info(`Starting update tracking sync (syncId: ${syncId})`);
-  broadcast({ type: "sync_start", syncType: "update_check", syncId });
+// ── Update Tracking ──────────────────────────────────────────────────────────
+async function syncUpdates() {
+  logger.info("Starting update tracking…");
+  broadcast("update_start", { message: "Checking for case updates…" });
 
   try {
-    const approvedCases = await db.getCases({ reviewStatus: "approved" });
+    const approvedCases = await db.getCasesByStatus("Approved");
+    logger.info(`Checking updates for ${approvedCases.length} approved cases`);
+
     if (approvedCases.length === 0) {
-      await db.completeSyncLog(syncId, { updatesFound: 0 });
-      broadcast({ type: "sync_complete", syncType: "update_check", updatesFound: 0 });
-      return { updatesFound: 0 };
+      broadcast("update_complete", { message: "No approved cases to check", count: 0 });
+      return { count: 0 };
     }
 
-    logger.info(`Checking ${approvedCases.length} approved cases for updates`);
-    let updatesFound = 0;
-
-    const updates = await checkAllApprovedForUpdates(approvedCases, (progress) => {
-      broadcast({ type: "progress", ...progress });
-    });
+    const updates = await cl.checkForUpdates(approvedCases);
+    let newCount = 0;
 
     for (const update of updates) {
-      const c = approvedCases.find((x) => x.id === update.caseId);
-      if (!c) continue;
-
-      if (update.linked && update.clDocketId) {
-        await db.updateCaseClDocket(c.id, String(update.clDocketId), update.clLink || "");
-        await subscribeToDocket(update.clDocketId);
-        await db.insertUpdate({ caseId: c.id, updateType: "cl_linked", description: `Linked to CourtListener docket ${update.clDocketId}`, rawData: update.meta });
-        updatesFound++;
-        continue;
+      const exists = await db.updateExists(update.docketEntryId);
+      if (!exists) {
+        await db.insertUpdate(update);
+        newCount++;
       }
-
-      if (update.entries?.length > 0) {
-        const newEntries = update.entries.filter((e) => !c.latestFilings.some((f) => f.entryNumber === e.entry_number));
-        for (const entry of newEntries) {
-          await db.insertUpdate({ caseId: c.id, updateType: "new_filing", description: entry.description || `Entry #${entry.entry_number}`, entryNumber: String(entry.entry_number || ""), dateFiled: entry.date_filed, documents: (entry.recap_documents || []).map((d) => ({ id: d.id, description: d.description, filepath: d.filepath_local })), rawData: entry });
-          updatesFound++;
-        }
-        if (newEntries.length > 0) {
-          await db.updateCaseLatestFilings(c.id, update.entries.slice(0, 10).map((e) => ({ entryNumber: e.entry_number, dateFiled: e.date_filed, description: e.description })));
-        }
-      }
-      await db.updateCaseLastClCheck(c.id);
     }
 
-    await db.completeSyncLog(syncId, { updatesFound });
-    broadcast({ type: "sync_complete", syncType: "update_check", updatesFound });
-    logger.info(`Update sync complete: ${updatesFound} updates`);
-    return { updatesFound };
+    const msg = `Update check complete: ${newCount} new filings found`;
+    logger.info(msg);
+    broadcast("update_complete", { message: msg, count: newCount });
+
+    return { count: newCount };
   } catch (err) {
-    await db.failSyncLog(syncId, err.message);
-    broadcast({ type: "sync_error", syncType: "update_check", error: err.message });
     logger.error(`Update sync failed: ${err.message}`);
+    broadcast("update_error", { message: err.message });
     throw err;
   }
 }
 
-function startScheduledJobs() {
-  const schedule = process.env.SYNC_CRON_SCHEDULE || "0 8 * * *";
-  logger.info(`Scheduling case sync: ${schedule}`);
-  cron.schedule(schedule, () => runCaseIdentificationSync().catch((e) => logger.error(e.message)));
-  cron.schedule("0 9,17 * * *", () => runUpdateTrackingSync().catch((e) => logger.error(e.message)));
+// ── Cron Scheduling ──────────────────────────────────────────────────────────
+function scheduleJobs() {
+  const caseCron = process.env.SYNC_CRON_SCHEDULE || "0 8 * * *";
+  logger.info(`Scheduling case sync: ${caseCron}`);
+
+  cron.schedule(caseCron, () => {
+    syncCases().catch((err) => logger.error(`Scheduled case sync failed: ${err.message}`));
+  });
+
+  // Update checks twice daily
+  cron.schedule("0 9,17 * * *", () => {
+    syncUpdates().catch((err) => logger.error(`Scheduled update sync failed: ${err.message}`));
+  });
+
   logger.info("Scheduled jobs registered");
 }
 
-module.exports = { runCaseIdentificationSync, runUpdateTrackingSync, startScheduledJobs, addSseClient, broadcast };
+module.exports = { syncCases, syncUpdates, scheduleJobs, addSseClient };
